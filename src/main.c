@@ -1,3 +1,15 @@
+/*
+ * main.c: Main entry point for the EEG Signal Analysis Pipeline.
+ *
+ * This program reads a specified column from a CSV file, performs a series of
+ * signal processing analyses (Autocorrelation, Periodogram, Welch's, Multitaper)
+ * on the raw signal, and then repeats the entire analysis on a pre-processed
+ * version of the signal (detrended and band-pass filtered).
+ *
+ * It benchmarks the performance of each analysis method and writes all numerical
+ * results to text files for later visualization by a Python script.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,16 +19,8 @@
 
 #define SAMPLING_RATE 256.0
 
-// Global variables
-static SignalData g_signal;
-static double *g_psd_periodogram, *g_psd_welch, *g_psd_multitaper;
-static fftw_plan g_periodogram_plan = NULL;
-static int g_welch_nperseg;
-
-// Wrappers
-void run_periodogram_wrapper() { psd_periodogram(&g_signal, g_psd_periodogram, &g_periodogram_plan); }
-void run_welch_wrapper() { psd_welch(&g_signal, g_psd_welch, g_welch_nperseg, g_welch_nperseg / 2); }
-void run_multitaper_wrapper() { psd_multitaper(&g_signal, g_psd_multitaper); }
+// A helper function to run the full analysis pipeline on a given signal
+void run_full_analysis(SignalData* signal, const char* suffix, const char* data_dir, FILE* perf_file);
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
@@ -29,93 +33,155 @@ int main(int argc, char *argv[]) {
     const char *data_dir = argv[3];
     char filepath[256];
 
-    g_signal = read_csv_column(filename, column_name);
-    if (g_signal.data == NULL) return 1;
-    printf("Read %d data points.\n", g_signal.count);
+    SignalData original_signal = read_csv_column(filename, column_name);
+    if (original_signal.data == NULL) return 1;
+    printf("Read %d data points from column '%s'.\n", original_signal.count, column_name);
 
-    // --- Write config file for Python ---
+    // --- Write config file for Python plotter ---
     int welch_windows[] = {128, 256, 512, 1024, 2048, 4096};
     int num_windows = sizeof(welch_windows) / sizeof(welch_windows[0]);
     snprintf(filepath, sizeof(filepath), "%s/config.txt", data_dir);
     FILE* config_file = fopen(filepath, "w");
     if (config_file) {
         fprintf(config_file, "sampling_rate,%.1f\n", SAMPLING_RATE);
-        fprintf(config_file, "signal_length,%d\n", g_signal.count);
+        fprintf(config_file, "signal_length,%d\n", original_signal.count);
         fprintf(config_file, "welch_windows");
-        for (int i = 0; i < num_windows; i++) {
-            fprintf(config_file, ",%d", welch_windows[i]);
-        }
+        for (int i = 0; i < num_windows; i++) { fprintf(config_file, ",%d", welch_windows[i]); }
         fprintf(config_file, "\n");
         fclose(config_file);
     }
 
-    // --- Autocorrelation ---
-    printf("Calculating autocorrelation...\n");
-    double *acf = (double *)malloc(g_signal.count * sizeof(double));
-    calculate_autocorrelation(&g_signal, acf);
-    snprintf(filepath, sizeof(filepath), "%s/acf.txt", data_dir);
-    write_array_to_file(filepath, acf, g_signal.count);
-    free(acf);
-    
-    // --- Performance Analysis ---
-    FILE *perf_file = fopen("results/performance/performance.txt", "w");
+    // --- Prepare performance results file ---
+    snprintf(filepath, sizeof(filepath), "results/performance/performance.txt");
+    FILE *perf_file = fopen(filepath, "w");
+    if (!perf_file) {
+        perror("Failed to open performance file");
+        return 1;
+    }
     fprintf(perf_file, "Method,ExecutionTime_s,CPUUserTime_us,CPUSystemTime_us,PeakMemory_kb\n");
+
+    // --- Run 1: Analysis on Original Signal ---
+    printf("\n--- Running Analysis on ORIGINAL Signal ---\n");
+    run_full_analysis(&original_signal, "", data_dir, perf_file);
+
+    // --- Create a copy of the signal to be filtered ---
+    SignalData filtered_signal;
+    filtered_signal.count = original_signal.count;
+    filtered_signal.data = (double*)malloc(original_signal.count * sizeof(double));
+    if (filtered_signal.data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for filtered signal.\n");
+        return 1;
+    }
+    memcpy(filtered_signal.data, original_signal.data, original_signal.count * sizeof(double));
+    
+    // --- Pre-process the copied signal ---
+    printf("\n--- Pre-processing Signal for Second Run (1-40 Hz 4th-Order Butterworth Band-pass) ---\n");
+    detrend_signal(&filtered_signal);
+    // MODIFIED: Using the new, more powerful 4th-order filter
+    butterworth_bandpass_filter_4th_order(&filtered_signal, SAMPLING_RATE, 1.0, 40.0);
+
+    // --- Run 2: Analysis on Filtered Signal ---
+    printf("\n--- Running Analysis on FILTERED Signal ---\n");
+    run_full_analysis(&filtered_signal, "_filtered", data_dir, perf_file);
+
+    // --- Finalization ---
+    fclose(perf_file);
+    free_signal_data(&original_signal);
+    free_signal_data(&filtered_signal);
+    fftw_cleanup(); // Free resources used by FFTW
+
+    printf("\nAnalysis complete for both original and filtered signals.\n");
+    return 0;
+}
+
+/**
+ * @brief Runs the complete set of analyses on a signal and records performance.
+ *
+ * This function calculates and saves the autocorrelation and three types of PSD
+ * estimates (Periodogram, Welch, Multitaper). It measures the performance of
+ * each PSD method and writes the results to the provided performance file.
+ *
+ * @param signal The input signal data.
+ * @param suffix A string to append to output filenames (e.g., "" or "_filtered").
+ * @param data_dir The directory to save the output data files.
+ * @param perf_file A file pointer to the performance log.
+ */
+void run_full_analysis(SignalData* signal, const char* suffix, const char* data_dir, FILE* perf_file) {
+    char filepath[256];
+    char method_name[128];
     PerformanceMetrics metrics;
     struct rusage usage_start, usage_end;
     struct timespec timer_start;
 
-    // 1. Periodogram
+    // Save the raw (or filtered) signal data
+    snprintf(filepath, sizeof(filepath), "%s/signal%s.txt", data_dir, suffix);
+    write_array_to_file(filepath, signal->data, signal->count);
+
+    // --- Autocorrelation ---
+    printf("Calculating autocorrelation...\n");
+    double *acf = (double *)malloc(signal->count * sizeof(double));
+    if (!acf) { fprintf(stderr, "ACF allocation failed.\n"); return; }
+    calculate_autocorrelation(signal, acf);
+    snprintf(filepath, sizeof(filepath), "%s/acf%s.txt", data_dir, suffix);
+    write_array_to_file(filepath, acf, signal->count);
+    free(acf);
+
+    // --- PSD: Periodogram ---
     printf("Analyzing PSD with Periodogram...\n");
-    g_psd_periodogram = (double *)malloc((g_signal.count / 2 + 1) * sizeof(double));
-    start_timer(&timer_start); get_cpu_usage(&usage_start); run_periodogram_wrapper(); get_cpu_usage(&usage_end);
-    metrics.execution_time_sec = stop_timer(&timer_start); metrics.peak_memory_kb = get_peak_memory_kb();
+    double* psd_periodogram_data = (double *)malloc((signal->count / 2 + 1) * sizeof(double));
+    if (!psd_periodogram_data) { fprintf(stderr, "Periodogram allocation failed.\n"); return; }
+    fftw_plan p = NULL; // Plan is created inside the function
+    start_timer(&timer_start); get_cpu_usage(&usage_start);
+    psd_periodogram(signal, psd_periodogram_data, &p);
+    get_cpu_usage(&usage_end); metrics.execution_time_sec = stop_timer(&timer_start);
+    metrics.peak_memory_kb = get_peak_memory_kb();
     metrics.cpu_user_time_us = (usage_end.ru_utime.tv_sec - usage_start.ru_utime.tv_sec) * 1000000L + (usage_end.ru_utime.tv_usec - usage_start.ru_utime.tv_usec);
     metrics.cpu_system_time_us = (usage_end.ru_stime.tv_sec - usage_start.ru_stime.tv_sec) * 1000000L + (usage_end.ru_stime.tv_usec - usage_start.ru_stime.tv_usec);
-    fprintf(perf_file, "Periodogram,%.6f,%ld,%ld,%ld\n", metrics.execution_time_sec, metrics.cpu_user_time_us, metrics.cpu_system_time_us, metrics.peak_memory_kb);
-    snprintf(filepath, sizeof(filepath), "%s/periodogram.txt", data_dir);
-    write_array_to_file(filepath, g_psd_periodogram, g_signal.count / 2 + 1);
-    free(g_psd_periodogram);
+    snprintf(method_name, sizeof(method_name), "Periodogram%s", suffix);
+    fprintf(perf_file, "%s,%.6f,%ld,%ld,%ld\n", method_name, metrics.execution_time_sec, metrics.cpu_user_time_us, metrics.cpu_system_time_us, metrics.peak_memory_kb);
+    snprintf(filepath, sizeof(filepath), "%s/periodogram%s.txt", data_dir, suffix);
+    write_array_to_file(filepath, psd_periodogram_data, signal->count / 2 + 1);
+    free(psd_periodogram_data);
+    fftw_destroy_plan(p);
 
-    // 2. Welch (Multiple Windows)
+    // --- PSD: Welch's Method ---
     printf("Analyzing PSD with Welch (multiple windows)...\n");
+    int welch_windows[] = {128, 256, 512, 1024, 2048, 4096};
+    int num_windows = sizeof(welch_windows) / sizeof(welch_windows[0]);
     for (int i = 0; i < num_windows; i++) {
-        g_welch_nperseg = welch_windows[i];
-        if (g_signal.count < g_welch_nperseg) {
-            printf("  Skipping Welch with %d-point window (signal is too short).\n", g_welch_nperseg);
-            continue;
-        }
-        printf("  Running Welch with %d-point window...\n", g_welch_nperseg);
-        g_psd_welch = (double *)malloc((g_welch_nperseg / 2 + 1) * sizeof(double));
-        start_timer(&timer_start); get_cpu_usage(&usage_start); run_welch_wrapper(); get_cpu_usage(&usage_end);
-        metrics.execution_time_sec = stop_timer(&timer_start); metrics.peak_memory_kb = get_peak_memory_kb();
+        int nperseg = welch_windows[i];
+        if (signal->count < nperseg) continue;
+        
+        double* psd_welch_data = (double *)malloc((nperseg / 2 + 1) * sizeof(double));
+        if (!psd_welch_data) { fprintf(stderr, "Welch allocation failed for window %d.\n", nperseg); continue; }
+        
+        start_timer(&timer_start); get_cpu_usage(&usage_start);
+        psd_welch(signal, psd_welch_data, nperseg, nperseg / 2); // 50% overlap
+        get_cpu_usage(&usage_end); metrics.execution_time_sec = stop_timer(&timer_start);
+        metrics.peak_memory_kb = get_peak_memory_kb();
         metrics.cpu_user_time_us = (usage_end.ru_utime.tv_sec - usage_start.ru_utime.tv_sec) * 1000000L + (usage_end.ru_utime.tv_usec - usage_start.ru_utime.tv_usec);
         metrics.cpu_system_time_us = (usage_end.ru_stime.tv_sec - usage_start.ru_stime.tv_sec) * 1000000L + (usage_end.ru_stime.tv_usec - usage_start.ru_stime.tv_usec);
-        fprintf(perf_file, "Welch_%d,%.6f,%ld,%ld,%ld\n", g_welch_nperseg, metrics.execution_time_sec, metrics.cpu_user_time_us, metrics.cpu_system_time_us, metrics.peak_memory_kb);
-        snprintf(filepath, sizeof(filepath), "%s/welch_%d.txt", data_dir, g_welch_nperseg);
-        write_array_to_file(filepath, g_psd_welch, g_welch_nperseg / 2 + 1);
-        free(g_psd_welch);
+        
+        snprintf(method_name, sizeof(method_name), "Welch_%d%s", nperseg, suffix);
+        fprintf(perf_file, "%s,%.6f,%ld,%ld,%ld\n", method_name, metrics.execution_time_sec, metrics.cpu_user_time_us, metrics.cpu_system_time_us, metrics.peak_memory_kb);
+        snprintf(filepath, sizeof(filepath), "%s/welch_%d%s.txt", data_dir, nperseg, suffix);
+        write_array_to_file(filepath, psd_welch_data, nperseg / 2 + 1);
+        free(psd_welch_data);
     }
 
-    // 3. Multitaper
+    // --- PSD: Multitaper ---
     printf("Analyzing PSD with Multitaper...\n");
-    g_psd_multitaper = (double *)malloc((g_signal.count / 2 + 1) * sizeof(double));
-    start_timer(&timer_start); get_cpu_usage(&usage_start); run_multitaper_wrapper(); get_cpu_usage(&usage_end);
-    metrics.execution_time_sec = stop_timer(&timer_start); metrics.peak_memory_kb = get_peak_memory_kb();
+    double* psd_multitaper_data = (double *)malloc((signal->count / 2 + 1) * sizeof(double));
+    if (!psd_multitaper_data) { fprintf(stderr, "Multitaper allocation failed.\n"); return; }
+    start_timer(&timer_start); get_cpu_usage(&usage_start);
+    psd_multitaper(signal, psd_multitaper_data);
+    get_cpu_usage(&usage_end); metrics.execution_time_sec = stop_timer(&timer_start);
+    metrics.peak_memory_kb = get_peak_memory_kb();
     metrics.cpu_user_time_us = (usage_end.ru_utime.tv_sec - usage_start.ru_utime.tv_sec) * 1000000L + (usage_end.ru_utime.tv_usec - usage_start.ru_utime.tv_usec);
     metrics.cpu_system_time_us = (usage_end.ru_stime.tv_sec - usage_start.ru_stime.tv_sec) * 1000000L + (usage_end.ru_stime.tv_usec - usage_start.ru_stime.tv_usec);
-    fprintf(perf_file, "Multitaper,%.6f,%ld,%ld,%ld\n", metrics.execution_time_sec, metrics.cpu_user_time_us, metrics.cpu_system_time_us, metrics.peak_memory_kb);
-    snprintf(filepath, sizeof(filepath), "%s/multitaper.txt", data_dir);
-    write_array_to_file(filepath, g_psd_multitaper, g_signal.count / 2 + 1);
-    free(g_psd_multitaper);
-
-    // --- Finalization ---
-    fclose(perf_file);
-    snprintf(filepath, sizeof(filepath), "%s/signal.txt", data_dir);
-    write_array_to_file(filepath, g_signal.data, g_signal.count);
-    fftw_destroy_plan(g_periodogram_plan);
-    free_signal_data(&g_signal);
-    fftw_cleanup();
-
-    printf("Analysis complete.\n");
-    return 0;
+    snprintf(method_name, sizeof(method_name), "Multitaper%s", suffix);
+    fprintf(perf_file, "%s,%.6f,%ld,%ld,%ld\n", method_name, metrics.execution_time_sec, metrics.cpu_user_time_us, metrics.cpu_system_time_us, metrics.peak_memory_kb);
+    snprintf(filepath, sizeof(filepath), "%s/multitaper%s.txt", data_dir, suffix);
+    write_array_to_file(filepath, psd_multitaper_data, signal->count / 2 + 1);
+    free(psd_multitaper_data);
 }

@@ -3,224 +3,156 @@ import matplotlib.pyplot as plt
 import csv
 import os
 from scipy import stats
-from scipy.stats import norm # NEW: Import norm for Gaussian fit
+from scipy.stats import norm
 
-# Standard EEG frequency bands
-EEG_BANDS = {
-    'Delta': (0.5, 4),
-    'Theta': (4, 8),
-    'Alpha': (8, 12),
-    'Beta': (12, 30),
-    'Gamma': (30, 100)
-}
+# A small constant to add before taking a logarithm to avoid log(0) errors.
+EPSILON = 1e-10
 
-# The individual plotting functions (plot_signal, plot_autocorrelation, etc.)
-# remain the same. The changes are in plot_psd_distributions and main().
+# --- Core Comparison Plotting Functions ---
 
-def plot_signal(data, sampling_rate, output_path):
-    time_axis = np.arange(len(data)) / sampling_rate
-    plt.figure(figsize=(12, 6))
-    plt.plot(time_axis, data)
-    plt.title(f"EEG Signal Feature (lag1_mean_0)\n({len(data)} Samples at {sampling_rate} Hz)")
-    plt.xlabel("Time (s)"); plt.ylabel("Amplitude (arbitrary units)"); plt.grid(True); plt.tight_layout()
-    plt.savefig(os.path.join(output_path, "01_eeg_signal.png"))
+def plot_signal_comparison_overlay(original, filtered, sampling_rate, output_path):
+    """Plots the entire signal in the time domain."""
+    plt.figure(figsize=(15, 7))
+    time_axis = np.arange(len(original)) / sampling_rate
+    plt.plot(time_axis, original, label='Original', alpha=0.7)
+    plt.plot(time_axis, filtered, label='Filtered (1-40 Hz)', alpha=0.9, linewidth=1.5)
+    plt.title(f"Full Signal in Time Domain\n({len(original)} Samples at {sampling_rate} Hz)")
+    plt.xlabel('Time (s)'); plt.ylabel('Amplitude'); plt.grid(True)
+    plt.legend(loc='lower center', ncol=2)
+    plt.tight_layout(); plt.savefig(os.path.join(output_path, "comparison_signal_full.png"))
+    # We don't close the plot here so plt.show() can display it
 
-def plot_autocorrelation(data, sampling_rate, output_path):
-    max_lags_samples = min(len(data), 1024)
-    lag_axis_s = np.arange(max_lags_samples) / sampling_rate
-    plt.figure(figsize=(12, 6))
-    plt.plot(lag_axis_s, data[:max_lags_samples])
-    plt.title(f"Autocorrelation Function\n({len(data)} Samples at {sampling_rate} Hz)")
-    plt.xlabel("Lag (s)"); plt.ylabel("Correlation"); plt.grid(True); plt.tight_layout()
-    plt.savefig(os.path.join(output_path, "02_autocorrelation.png"))
+def plot_autocorrelation_comparison_overlay(original_acf, filtered_acf, sampling_rate, output_path):
+    max_lags = min(len(original_acf), 1024)
+    lag_axis = np.arange(max_lags) / sampling_rate
+    plt.figure(figsize=(15, 7))
+    plt.plot(lag_axis, original_acf[:max_lags], label='Original', alpha=0.7)
+    plt.plot(lag_axis, filtered_acf[:max_lags], label='Filtered (1-40 Hz)', alpha=0.9, linewidth=1.5)
+    plt.title('Direct Comparison: Autocorrelation')
+    plt.xlabel('Lag (s)'); plt.ylabel('Normalized Correlation'); plt.grid(True)
+    plt.legend(loc='lower center', ncol=2)
+    plt.tight_layout(); plt.savefig(os.path.join(output_path, "comparison_autocorrelation.png"))
+    # We don't close the plot here
 
-def plot_psd(psd_data, n_fft, sampling_rate, method_name, perf_metrics, output_path, filename):
+def plot_psd_comparison_overlay(original_psd, filtered_psd, n_fft, sampling_rate, method_name, perf_orig, perf_filt, output_path):
     freq_axis = np.fft.rfftfreq(n_fft, d=1.0 / sampling_rate)
-    plt.figure(figsize=(12, 7))
-    max_freq_display = 60
-    freq_mask = freq_axis <= max_freq_display
-    log_psd_for_test = np.log10(psd_data[freq_mask])
-    if len(log_psd_for_test) > 3:
-        shapiro_stat, shapiro_p = stats.shapiro(log_psd_for_test)
-        is_gaussian = "No (p < 0.05)" if shapiro_p < 0.05 else "Yes (p >= 0.05)"
-    else:
-        shapiro_p, is_gaussian = (0, "N/A")
-    plt.semilogy(freq_axis[freq_mask], psd_data[freq_mask])
-    plt.title(f"Power Spectral Density (PSD) - {method_name}\n({n_fft}-point FFT, Sampling Rate: {sampling_rate} Hz)")
-    plt.xlabel("Frequency (Hz)"); plt.ylabel("Power/Frequency (log scale)"); plt.grid(True, which='both', linestyle='--')
-    handles, labels = plt.gca().get_legend_handles_labels()
-    band_labels = set(labels)
-    for band, (low, high) in EEG_BANDS.items():
-        if high < max_freq_display:
-            label = f'{band}: {low}-{high} Hz'
-            if label not in band_labels:
-                plt.axvspan(low, high, facecolor='gray', alpha=0.2, label=label)
-                band_labels.add(label)
-    plt.legend(loc='upper right', fontsize='small')
-    time_s = float(perf_metrics.get('ExecutionTime_s', 0)); cpu_u_s = int(perf_metrics.get('CPUUserTime_us', 0)) / 1e6
-    cpu_s_s = int(perf_metrics.get('CPUSystemTime_us', 0)) / 1e6; mem_kb = int(perf_metrics.get('PeakMemory_kb', 0))
-    perf_text = (f"Performance Metrics:\n--------------------\n"
-                 f"Execution Time (s): {time_s:.6f}\nCPU Time - User (s): {cpu_u_s:.6f}\n"
-                 f"CPU Time - System (s): {cpu_s_s:.6f}\nPeak Memory (KB): {mem_kb}\n\n"
-                 f"Gaussianity Test (on log PSD):\n--------------------\n"
-                 f"Shapiro-Wilk p-value: {shapiro_p:.2e}\n"
-                 f"Normally Distributed?: {is_gaussian}")
-    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-    plt.figtext(0.65, 0.78, perf_text, fontsize=9, verticalalignment='top', bbox=props)
-    plt.tight_layout(rect=[0, 0, 0.95, 1]); plt.savefig(os.path.join(output_path, filename))
-
-def plot_psd_comparison(psd_periodogram, psd_welch_rep, psd_multitaper, signal_length, welch_nperseg_rep, sampling_rate, output_path):
-    freq_axis_full = np.fft.rfftfreq(signal_length, d=1.0 / sampling_rate)
-    freq_axis_welch = np.fft.rfftfreq(welch_nperseg_rep, d=1.0 / sampling_rate)
-    plt.figure(figsize=(12, 7)); max_freq_display = 60
-    mask_full = freq_axis_full <= max_freq_display; mask_welch = freq_axis_welch <= max_freq_display
-    plt.semilogy(freq_axis_full[mask_full], psd_periodogram[mask_full], label='Periodogram', alpha=0.7, linewidth=1)
-    plt.semilogy(freq_axis_welch[mask_welch], psd_welch_rep[mask_welch], label=f'Welch ({welch_nperseg_rep}-point window)', linewidth=2)
-    plt.semilogy(freq_axis_full[mask_full], psd_multitaper[mask_full], label='Multitaper', alpha=0.7, linewidth=1)
-    plt.title(f"Comparison of PSD Estimation Methods\n(Sampling Rate: {sampling_rate} Hz)")
-    plt.xlabel("Frequency (Hz)"); plt.ylabel("Power/Frequency (log scale)"); plt.grid(True, which='both', linestyle='--')
-    plt.legend(); plt.tight_layout(); plt.savefig(os.path.join(output_path, "06_psd_comparison.png"))
-
-def plot_welch_comparison(psd_welch_data, sampling_rate, output_path):
-    plt.figure(figsize=(12, 7)); max_freq_display = 60
-    for window_size, psd_data in psd_welch_data.items():
-        freq_axis = np.fft.rfftfreq(window_size, d=1.0 / sampling_rate)
-        mask = freq_axis <= max_freq_display
-        plt.semilogy(freq_axis[mask], psd_data[mask], label=f'Welch ({window_size}-point window)', alpha=0.8)
-    plt.title(f"Welch's Method PSD with Varying Window Sizes\n(Sampling Rate: {sampling_rate} Hz)")
-    plt.xlabel("Frequency (Hz)"); plt.ylabel("Power/Frequency (log scale)"); plt.grid(True, which='both', linestyle='--')
-    plt.legend(); plt.tight_layout(); plt.savefig(os.path.join(output_path, "07_welch_comparison.png"))
-
-# --- UPDATED FUNCTION ---
-def plot_psd_distributions(psd_periodogram, psd_welch_rep, psd_multitaper, output_path):
-    """Creates histograms with a Gaussian fit to show the distribution of log-scaled PSD values."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
-    fig.suptitle('Distribution of Power Spectral Density Values (log scale)', fontsize=16)
-
-    # Data for histograms (log-scaled)
-    log_psd_p = np.log10(psd_periodogram)
-    log_psd_w = np.log10(psd_welch_rep)
-    log_psd_m = np.log10(psd_multitaper)
+    fig, ax = plt.subplots(figsize=(14, 8)); max_freq = 60
     
-    datasets = {
-        'Periodogram': (log_psd_p, 'C0', axes[0]),
-        'Welch (1024-point)': (log_psd_w, 'C1', axes[1]),
-        'Multitaper': (log_psd_m, 'C2', axes[2])
-    }
+    mask = freq_axis <= max_freq
 
-    for name, (data, color, ax) in datasets.items():
-        # Plot the histogram
-        counts, bins, _ = ax.hist(data, bins=100, alpha=0.75, color=color, density=False)
-        
-        # Calculate Gaussian fit
-        mu, std = norm.fit(data)
-        
-        # Create x-axis for the fit curve
-        x_fit = np.linspace(bins[0], bins[-1], 100)
-        
-        # Calculate the PDF and scale it to match the histogram's counts
-        pdf = norm.pdf(x_fit, mu, std)
-        bin_width = bins[1] - bins[0]
-        scaled_pdf = pdf * len(data) * bin_width
-        
-        # Plot the fit
-        ax.plot(x_fit, scaled_pdf, 'r--', linewidth=2, label=f'Gaussian Fit\n(μ={mu:.2f}, σ={std:.2f})')
-        
-        ax.set_title(f'{name} PSD Distribution')
-        ax.set_xlabel('log10(Power)')
-        ax.legend()
-        ax.grid(True, linestyle=':')
+    ax.plot(freq_axis[mask], original_psd[mask], label='Original', alpha=0.85)
+    ax.plot(freq_axis[mask], filtered_psd[mask], label='Filtered', linewidth=1.5)
+    
+    ax.axvspan(1, 40, color='gray', alpha=0.2, label='Passband (1-40 Hz)')
+    ax.set_title(f'Direct Comparison - {method_name}\nOriginal vs. Filtered (1-40 Hz)\n(Sampling Rate: {sampling_rate} Hz, FFT Points: {n_fft})', fontsize=14)
+    ax.set_xlabel('Frequency (Hz)'); ax.set_ylabel('Power/Frequency (dB)'); ax.grid(True, which='both', linestyle='--')
+    ax.legend(loc='lower center', ncol=3)
 
-    axes[0].set_ylabel('Count')
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(os.path.join(output_path, "08_psd_distributions.png"))
+    min_val = min(np.min(original_psd[mask]), np.min(filtered_psd[mask]))
+    max_val = max(np.max(original_psd[mask]), np.max(filtered_psd[mask]))
+    ax.set_ylim(min_val - 5, max_val + 5)
 
-# --- UPDATED FUNCTION ---
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.9)
+    time_s_orig = float(perf_orig.get('ExecutionTime_s', 0)); cpu_u_s_orig = int(perf_orig.get('CPUUserTime_us', 0)) / 1e6
+    text_orig = (f"Original Data:\n--------------------\n"
+                 f"Exec Time: {time_s_orig:.5f} s\nCPU Time: {cpu_u_s_orig:.5f} s\n"
+                 f"Peak Mem: {perf_orig.get('PeakMemory_kb', 'N/A')} KB")
+    ax.text(0.02, 0.98, text_orig, transform=ax.transAxes, fontsize=8, va='top', ha='left', bbox=props)
+    time_s_filt = float(perf_filt.get('ExecutionTime_s', 0)); cpu_u_s_filt = int(perf_filt.get('CPUUserTime_us', 0)) / 1e6
+    text_filt = (f"Filtered Data:\n--------------------\n"
+                 f"Exec Time: {time_s_filt:.5f} s\nCPU Time: {cpu_u_s_filt:.5f} s\n"
+                 f"Peak Mem: {perf_filt.get('PeakMemory_kb', 'N/A')} KB")
+    ax.text(0.98, 0.98, text_filt, transform=ax.transAxes, fontsize=8, va='top', ha='right', bbox=props)
+
+    plt.tight_layout(); plt.savefig(os.path.join(output_path, f"comparison_{method_name.lower().replace(' ', '_')}.png"))
+    # We don't close the plot here
+
+def plot_welch_comparison_subplots(psd_welch_orig, psd_welch_filt, perf_data, sampling_rate, output_path):
+    window_sizes = sorted(psd_welch_orig.keys())
+    fig, axes = plt.subplots(3, 2, figsize=(18, 15), sharey=False)
+    fig.suptitle(f"Direct Comparison: Welch's Method\n(Sampling Rate: {sampling_rate} Hz)", fontsize=16)
+    axes_flat = axes.flatten()
+    for i, window_size in enumerate(window_sizes):
+        ax = axes_flat[i]; freq_axis = np.fft.rfftfreq(window_size, d=1.0 / sampling_rate)
+        
+        mask = freq_axis <= 60
+
+        ax.plot(freq_axis[mask], psd_welch_orig[window_size][mask], label='Original', alpha=0.7)
+        ax.plot(freq_axis[mask], psd_welch_filt[window_size][mask], label='Filtered', linewidth=1.5)
+        
+        ax.axvspan(1, 40, color='gray', alpha=0.2)
+        ax.set_title(f"Welch ({window_size}-point window)"); ax.grid(True, which='both', linestyle='--')
+        
+        min_val = min(np.min(psd_welch_orig[window_size][mask]), np.min(psd_welch_filt[window_size][mask]))
+        max_val = max(np.max(psd_welch_orig[window_size][mask]), np.max(psd_welch_filt[window_size][mask]))
+        ax.set_ylim(min_val - (0.1 * abs(min_val)), max_val + (0.1 * abs(max_val)))
+
+    handles, labels = axes_flat[0].get_legend_handles_labels(); fig.legend(handles, labels, loc='upper right')
+    for ax in axes[-1, :]: ax.set_xlabel('Frequency (Hz)')
+    for ax in axes[:, 0]: ax.set_ylabel('Power/Frequency (dB)')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.savefig(os.path.join(output_path, "comparison_welch_subplots.png"))
+    # We don't close the plot here
+
+def plot_distribution_comparison(psd_periodogram_orig, psd_periodogram_filt, psd_welch_rep_orig, psd_welch_rep_filt, psd_multitaper_orig, psd_multitaper_filt, output_path):
+    fig, axes = plt.subplots(1, 3, figsize=(20, 7), sharey=True)
+    fig.suptitle('Direct Comparison: Distribution of PSD Values (dB)', fontsize=16)
+    datasets = {'Periodogram': (psd_periodogram_orig, psd_periodogram_filt, axes[0]), 'Welch (1024-point)': (psd_welch_rep_orig, psd_welch_rep_filt, axes[1]), 'Multitaper': (psd_multitaper_orig, psd_multitaper_filt, axes[2])}
+    for name, (data_orig, data_filt, ax) in datasets.items():
+        ax.hist(data_orig, bins=100, alpha=0.7, label='Original', density=True)
+        ax.hist(data_filt, bins=100, alpha=0.7, label='Filtered', density=True)
+        mu_orig, std_orig = norm.fit(data_orig); x_fit_orig = np.linspace(data_orig.min(), data_orig.max(), 100)
+        ax.plot(x_fit_orig, norm.pdf(x_fit_orig, mu_orig, std_orig), color='blue', linestyle='--', linewidth=2, label=f'Original Fit (σ={std_orig:.2f})')
+        mu_filt, std_filt = norm.fit(data_filt); x_fit_filt = np.linspace(data_filt.min(), data_filt.max(), 100)
+        ax.plot(x_fit_filt, norm.pdf(x_fit_filt, mu_filt, std_filt), color='red', linestyle='--', linewidth=2, label=f'Filtered Fit (σ={std_filt:.2f})')
+        ax.set_title(name); ax.set_xlabel('Power (dB)'); ax.legend(); ax.grid(True, linestyle=':')
+    axes[0].set_ylabel('Density'); plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.savefig(os.path.join(output_path, "comparison_distributions.png"))
+    # We don't close the plot here
+
 def main():
-    data_dir = os.path.join("results", "data")
-    plot_dir = os.path.join("results", "plots")
-    perf_file = os.path.join("results", "performance", "performance.txt")
-    config_file = os.path.join(data_dir, "config.txt")
-    
+    data_dir = os.path.join("results", "data"); plot_dir = os.path.join("results", "plots")
     print("Python plotter started...")
-
-    # Robust config file parsing
-    config = {}
     try:
-        with open(config_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split(',')
-                key = parts[0]
-                values = parts[1:]
-                if key == 'sampling_rate': config[key] = float(values[0])
-                elif key == 'signal_length': config[key] = int(values[0])
-                elif key == 'welch_windows': config[key] = [int(v) for v in values]
-        sampling_rate = config['sampling_rate']
-        signal_length = config['signal_length']
-        welch_windows = config['welch_windows']
-    except (IOError, KeyError, IndexError, ValueError) as e:
-        print(f"Error reading config file '{config_file}': {e}. Exiting."); return
-
-    # Load data
-    try:
-        signal = np.loadtxt(os.path.join(data_dir, "signal.txt"))
-        acf = np.loadtxt(os.path.join(data_dir, "acf.txt"))
-        psd_periodogram = np.loadtxt(os.path.join(data_dir, "periodogram.txt"))
-        psd_multitaper = np.loadtxt(os.path.join(data_dir, "multitaper.txt"))
-        psd_welch_data = {w: np.loadtxt(os.path.join(data_dir, f"welch_{w}.txt")) for w in welch_windows}
-    except IOError as e:
-        print(f"Error loading data files from '{data_dir}': {e}"); return
-
-    # Load performance metrics
+        with open(os.path.join(data_dir, "config.txt"), 'r') as f:
+            config_reader = csv.reader(f); config = {row[0]: [v for v in row[1:]] for row in config_reader}
+        config['sampling_rate'] = float(config['sampling_rate'][0]); config['signal_length'] = int(config['signal_length'][0])
+        config['welch_windows'] = [int(v) for v in config['welch_windows']]
+    except Exception as e:
+        print(f"Error reading config file: {e}. Exiting."); return
     perf_data = {}
     try:
-        with open(perf_file, 'r', newline='') as f:
+        with open(os.path.join("results", "performance", "performance.txt"), 'r', newline='') as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                perf_data[row['Method']] = row
-    except (IOError, KeyError) as e:
-        print(f"Error reading performance file '{perf_file}': {e}"); return
+            for row in reader: perf_data[row['Method']] = row
+    except Exception as e:
+        print(f"Error reading performance file: {e}"); return
+    try:
+        signal_orig = np.loadtxt(os.path.join(data_dir, "signal.txt")); signal_filt = np.loadtxt(os.path.join(data_dir, "signal_filtered.txt"))
+        acf_orig = np.loadtxt(os.path.join(data_dir, "acf.txt")); acf_orig = acf_orig / acf_orig[0]
+        acf_filt = np.loadtxt(os.path.join(data_dir, "acf_filtered.txt")); acf_filt = acf_filt / acf_filt[0]
+        periodogram_orig = 10 * np.log10(np.loadtxt(os.path.join(data_dir, "periodogram.txt")) + EPSILON)
+        periodogram_filt = 10 * np.log10(np.loadtxt(os.path.join(data_dir, "periodogram_filtered.txt")) + EPSILON)
+        multitaper_orig = 10 * np.log10(np.loadtxt(os.path.join(data_dir, "multitaper.txt")) + EPSILON)
+        multitaper_filt = 10 * np.log10(np.loadtxt(os.path.join(data_dir, "multitaper_filtered.txt")) + EPSILON)
+        psd_welch_orig = {w: 10 * np.log10(np.loadtxt(os.path.join(data_dir, f"welch_{w}.txt")) + EPSILON) for w in config['welch_windows']}
+        psd_welch_filt = {w: 10 * np.log10(np.loadtxt(os.path.join(data_dir, f"welch_{w}_filtered.txt")) + EPSILON) for w in config['welch_windows']}
+    except IOError as e:
+        print(f"Error loading data files: {e}"); return
+    except IndexError:
+        print("Error: Autocorrelation data appears to be empty. Cannot normalize. Exiting."); return
 
-    # --- Create all plot figures ---
-    print("Generating all plot figures...")
-    plot_signal(signal, sampling_rate, plot_dir)
-    plot_autocorrelation(acf, sampling_rate, plot_dir)
+    print("\n--- Generating direct comparison plots (Original vs. Filtered) ---")
+    plot_signal_comparison_overlay(signal_orig, signal_filt, config['sampling_rate'], plot_dir)
+    # MODIFIED: The call to the zoom plot function has been removed.
+    plot_autocorrelation_comparison_overlay(acf_orig, acf_filt, config['sampling_rate'], plot_dir)
+    plot_psd_comparison_overlay(periodogram_orig, periodogram_filt, config['signal_length'], config['sampling_rate'], "Periodogram", perf_data.get("Periodogram", {}), perf_data.get("Periodogram_filtered", {}), plot_dir)
+    plot_psd_comparison_overlay(multitaper_orig, multitaper_filt, config['signal_length'], config['sampling_rate'], "Multitaper", perf_data.get("Multitaper", {}), perf_data.get("Multitaper_filtered", {}), plot_dir)
+    plot_welch_comparison_subplots(psd_welch_orig, psd_welch_filt, perf_data, config['sampling_rate'], plot_dir)
+    plot_distribution_comparison(periodogram_orig, periodogram_filt, psd_welch_orig[1024], psd_welch_filt[1024], multitaper_orig, multitaper_filt, plot_dir)
+
+    print("\nAll plots have been saved to the 'results/plots' directory.")
+    print("Displaying all plots simultaneously. Close all plot windows to exit the script.")
     
-    if "Periodogram" in perf_data:
-        print("Generating Periodogram plot...")
-        plot_psd(psd_periodogram, signal_length, sampling_rate, "Periodogram", perf_data["Periodogram"], plot_dir, "03_psd_periodogram.png")
-
-    # Loop to create an individual plot for each Welch window
-    for window_size in welch_windows:
-        perf_key = f"Welch_{window_size}"
-        if perf_key in perf_data:
-            print(f"Generating individual plot for Welch {window_size}...")
-            method_title = f"Welch ({window_size}-point window)"
-            file_name = f"04_psd_welch_{window_size}.png"
-            plot_psd(psd_welch_data[window_size], window_size, sampling_rate, method_title, perf_data[perf_key], plot_dir, file_name)
-
-    if "Multitaper" in perf_data:
-        print("Generating Multitaper plot...")
-        plot_psd(psd_multitaper, signal_length, sampling_rate, "Multitaper", perf_data["Multitaper"], plot_dir, "05_psd_multitaper.png")
-
-    # Use a representative Welch window (e.g., 1024) for the summary plots
-    rep_welch_window = 1024
-    rep_welch_key = f"Welch_{rep_welch_window}"
-    if rep_welch_key in perf_data:
-        print("Generating general PSD comparison plot...")
-        plot_psd_comparison(psd_periodogram, psd_welch_data[rep_welch_window], psd_multitaper, signal_length, rep_welch_window, sampling_rate, plot_dir)
-        
-        print("Generating PSD distribution plot with Gaussian fit...")
-        plot_psd_distributions(psd_periodogram, psd_welch_data[rep_welch_window], psd_multitaper, plot_dir)
-
-    print("Generating Welch window comparison plot...")
-    plot_welch_comparison(psd_welch_data, sampling_rate, plot_dir)
-
-    # --- Show all created figures at once ---
-    print("Displaying all plots simultaneously. Close all windows to exit the script.")
     plt.show()
-
-    print("All plots have been saved.")
 
 if __name__ == "__main__":
     main()

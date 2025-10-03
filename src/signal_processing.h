@@ -4,6 +4,12 @@
 #include "csv_parser.h"
 #include <fftw3.h>
 
+// --- Pre-processing Functions ---
+void detrend_signal(SignalData *signal);
+// NEW: A superior, 4th-order Butterworth filter function
+void butterworth_bandpass_filter_4th_order(SignalData *signal, double sample_rate, double low_cutoff, double high_cutoff);
+
+
 // --- Analysis Functions ---
 void calculate_autocorrelation(const SignalData *signal, double *acf_result);
 void psd_periodogram(const SignalData *signal, double *psd, fftw_plan *p);
