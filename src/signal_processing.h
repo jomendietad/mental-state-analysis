@@ -5,9 +5,11 @@
 #include <fftw3.h>
 
 // --- Pre-processing Functions ---
+void normalize_signal(SignalData *signal);
 void detrend_signal(SignalData *signal);
-// NEW: A superior, 4th-order Butterworth filter function
 void butterworth_bandpass_filter_4th_order(SignalData *signal, double sample_rate, double low_cutoff, double high_cutoff);
+void quantize_signal_uniform(SignalData *signal, int num_levels); // Renamed for clarity
+void quantize_signal_mu_law(SignalData *signal, int num_levels, double mu); // NEW
 
 
 // --- Analysis Functions ---
