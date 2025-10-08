@@ -8,11 +8,12 @@
 // --- Pre-processing Implementations ---
 
 void normalize_signal(SignalData *signal) {
-    // ... (code is unchanged)
     if (signal->count == 0) return;
     double max_abs = 0.0;
     for (int i = 0; i < signal->count; i++) {
-        if (fabs(signal->data[i]) > max_abs) max_abs = fabs(signal->data[i]);
+        if (fabs(signal->data[i]) > max_abs) {
+            max_abs = fabs(signal->data[i]);
+        }
     }
     if (max_abs == 0.0) return;
     for (int i = 0; i < signal->count; i++) {
@@ -21,7 +22,6 @@ void normalize_signal(SignalData *signal) {
 }
 
 void detrend_signal(SignalData *signal) {
-    // ... (code is unchanged)
     long n = signal->count;
     if (n < 2) return;
     double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
@@ -38,7 +38,6 @@ void detrend_signal(SignalData *signal) {
 }
 
 void butterworth_bandpass_filter_4th_order(SignalData *signal, double sample_rate, double low_cutoff, double high_cutoff) {
-    // ... (code is unchanged)
     int n = signal->count;
     if (n < 5) return;
     const double b[] = {0.0469766, 0, -0.0939532, 0, 0.0469766};
@@ -58,9 +57,7 @@ void butterworth_bandpass_filter_4th_order(SignalData *signal, double sample_rat
     free(temp_data);
 }
 
-// RENAMED for clarity
 void quantize_signal_uniform(SignalData *signal, int num_levels) {
-    // ... (code is unchanged)
     if (signal->count == 0 || num_levels <= 1) return;
     double min_val = DBL_MAX;
     double max_val = -DBL_MAX;
@@ -76,48 +73,65 @@ void quantize_signal_uniform(SignalData *signal, int num_levels) {
     }
 }
 
-// --- NEW: Non-Uniform Quantization using mu-Law Algorithm ---
-// Helper function for mu-law compression
 double mu_law_compress(double x, double mu) {
     return copysign(1.0, x) * (log(1.0 + mu * fabs(x)) / log(1.0 + mu));
 }
-
-// Helper function for mu-law expansion
 double mu_law_expand(double y, double mu) {
     return copysign(1.0, y) * (1.0 / mu) * (pow(1.0 + mu, fabs(y)) - 1.0);
 }
-
 void quantize_signal_mu_law(SignalData *signal, int num_levels, double mu) {
-    if (signal->count == 0 || num_levels <= 1) {
-        return;
-    }
-    // Note: This function assumes the input signal is already normalized to [-1, 1]
-
-    // 1. Compress the signal using mu-law formula
+    if (signal->count == 0 || num_levels <= 1) return;
     for (int i = 0; i < signal->count; i++) {
         signal->data[i] = mu_law_compress(signal->data[i], mu);
     }
-
-    // 2. Apply UNIFORM quantization on the COMPRESSED signal
-    // The compressed signal theoretically ranges from -1 to 1.
-    double min_val = -1.0;
-    double max_val = 1.0;
-    double delta = (max_val - min_val) / (double)(num_levels - 1);
-
+    double delta = 2.0 / (double)(num_levels - 1);
     for (int i = 0; i < signal->count; i++) {
-        double level_index = round((signal->data[i] - min_val) / delta);
-        signal->data[i] = min_val + level_index * delta;
+        double level_index = round((signal->data[i] - (-1.0)) / delta);
+        signal->data[i] = -1.0 + level_index * delta;
     }
-
-    // 3. Expand the quantized signal back to the original domain
     for (int i = 0; i < signal->count; i++) {
         signal->data[i] = mu_law_expand(signal->data[i], mu);
     }
 }
 
+// --- NEW: PCM Encoding Implementation ---
+// Helper to convert an integer level to an 8-bit binary string
+void int_to_binary_string(int n, char *str) {
+    str[8] = '\0';
+    for (int i = 7; i >= 0; i--) {
+        str[i] = (n & 1) + '0';
+        n >>= 1;
+    }
+}
 
-// --- Analysis and Utility Functions (Unchanged) ---
-// ... (The rest of the functions are identical)
+void pcm_encode(const SignalData *quantized_signal, char **encoded_output, int num_levels) {
+    if (quantized_signal->count == 0 || num_levels <= 1) return;
+
+    // Find min/max of the quantized signal to map values back to levels
+    double min_val = DBL_MAX;
+    double max_val = -DBL_MAX;
+    for (int i = 0; i < quantized_signal->count; i++) {
+        if (quantized_signal->data[i] < min_val) min_val = quantized_signal->data[i];
+        if (quantized_signal->data[i] > max_val) max_val = quantized_signal->data[i];
+    }
+    if (max_val == min_val) { // Handle flat signal
+        for(int i = 0; i < quantized_signal->count; i++) {
+            int_to_binary_string(0, encoded_output[i]);
+        }
+        return;
+    }
+
+    double delta = (max_val - min_val) / (double)(num_levels - 1);
+
+    for (int i = 0; i < quantized_signal->count; i++) {
+        // Convert the quantized amplitude back to an integer level index
+        int level_index = (int)round((quantized_signal->data[i] - min_val) / delta);
+        // Convert the integer level to an 8-bit binary string
+        int_to_binary_string(level_index, encoded_output[i]);
+    }
+}
+
+// --- Analysis and Utility Functions ---
 void write_array_to_file(const char *filename, const double *data, int size) { FILE *f = fopen(filename, "w"); if (!f) { perror("Failed to open file"); return; } for (int i = 0; i < size; i++) { fprintf(f, "%.8f\n", data[i]); } fclose(f); }
 void calculate_autocorrelation(const SignalData *signal, double *acf_result) { int n = signal->count; for (int lag = 0; lag < n; lag++) { double sum = 0.0; for (int i = 0; i < n - lag; i++) { sum += signal->data[i] * signal->data[i + lag]; } acf_result[lag] = sum / n; } }
 void psd_periodogram(const SignalData *signal, double *psd, fftw_plan *p) { int n = signal->count; fftw_complex *out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * (n / 2 + 1)); if (*p == NULL) { *p = fftw_plan_dft_r2c_1d(n, (double*)signal->data, out, FFTW_ESTIMATE); } fftw_execute(*p); for (int i = 0; i < n / 2 + 1; i++) { psd[i] = (out[i][0] * out[i][0] + out[i][1] * out[i][1]) / n; } fftw_free(out); }

@@ -2,11 +2,12 @@
  * main.c: Main entry point for the EEG Signal Analysis Pipeline.
  *
  * This program reads a specified column from a CSV file, normalizes it,
- * and then performs a four-stage comparative analysis:
+ * and then performs a multi-stage comparative analysis:
  * 1. On the normalized original signal.
  * 2. On a pre-processed (detrended and filtered) version.
  * 3. On a uniformly quantized version of the filtered signal.
  * 4. On a non-uniformly (mu-law) quantized version of the filtered signal.
+ * 5. A PCM binary encoding is generated from the uniform quantized signal for visualization.
  *
  * It benchmarks each analysis and writes all results for Python visualization.
  */
@@ -22,7 +23,6 @@
 #define QUANTIZATION_LEVELS 256 // 2^8 for 8-bit quantization
 #define MU_PARAMETER 255.0      // Standard for 8-bit mu-law
 
-// A helper function to run the full analysis pipeline on a given signal
 void run_full_analysis(SignalData* signal, const char* suffix, const char* data_dir, FILE* perf_file);
 
 int main(int argc, char *argv[]) {
@@ -40,12 +40,10 @@ int main(int argc, char *argv[]) {
     if (raw_signal.data == NULL) return 1;
     printf("Read %d data points from column '%s'.\n", raw_signal.count, column_name);
 
-    // --- Pre-processing Step 1: Normalization ---
     printf("Normalizing signal to range [-1, 1]...\n");
     normalize_signal(&raw_signal);
 
     // --- Write config file for Python plotter ---
-    // ... (code is unchanged)
     int welch_windows[] = {128, 256, 512, 1024, 2048, 4096};
     int num_windows = sizeof(welch_windows) / sizeof(welch_windows[0]);
     snprintf(filepath, sizeof(filepath), "%s/config.txt", data_dir);
@@ -80,7 +78,7 @@ int main(int argc, char *argv[]) {
     memcpy(filtered_signal.data, raw_signal.data, raw_signal.count * sizeof(double));
     
     // --- Pre-processing Step 2: Detrend + Filter ---
-    printf("\n--- Pre-processing Signal (Detrend + 4th-Order Butterworth Filter) ---\n");
+    printf("\n--- Pre-processing Signal (Detrend + Filter) ---\n");
     detrend_signal(&filtered_signal);
     butterworth_bandpass_filter_4th_order(&filtered_signal, SAMPLING_RATE, 1.0, 40.0);
 
@@ -95,7 +93,7 @@ int main(int argc, char *argv[]) {
     if (uniform_quant_signal.data == NULL) { fprintf(stderr, "Failed to allocate memory for uniform quantized signal.\n"); return 1; }
     memcpy(uniform_quant_signal.data, filtered_signal.data, filtered_signal.count * sizeof(double));
 
-    // --- Pre-processing Step 3: Uniform Quantization ---
+    // --- Stage 3: Uniform Quantization ---
     printf("\n--- Uniformly Quantizing Filtered Signal (%d levels) ---\n", QUANTIZATION_LEVELS);
     quantize_signal_uniform(&uniform_quant_signal, QUANTIZATION_LEVELS);
 
@@ -110,13 +108,36 @@ int main(int argc, char *argv[]) {
     if (mu_law_quant_signal.data == NULL) { fprintf(stderr, "Failed to allocate memory for mu-law quantized signal.\n"); return 1; }
     memcpy(mu_law_quant_signal.data, filtered_signal.data, filtered_signal.count * sizeof(double));
 
-    // --- Pre-processing Step 4: Mu-Law Quantization ---
+    // --- Stage 4: Mu-Law Quantization ---
     printf("\n--- Mu-Law Quantizing Filtered Signal (mu=%.1f) ---\n", MU_PARAMETER);
     quantize_signal_mu_law(&mu_law_quant_signal, QUANTIZATION_LEVELS, MU_PARAMETER);
 
     // --- Run 4: Analysis on MU-LAW QUANTIZED Signal ---
     printf("\n--- Running Analysis on MU-LAW QUANTIZED Signal ---\n");
     run_full_analysis(&mu_law_quant_signal, "_mu_law_quantized", data_dir, perf_file);
+
+    // --- Stage 5: PCM Encoding (for visualization only) ---
+    printf("\n--- Generating PCM Encoded Stream for Visualization ---\n");
+    char **pcm_encoded_stream = malloc(uniform_quant_signal.count * sizeof(char *));
+    if (pcm_encoded_stream) {
+        for (int i = 0; i < uniform_quant_signal.count; i++) {
+            pcm_encoded_stream[i] = malloc(9 * sizeof(char)); // 8 bits + null terminator
+        }
+        pcm_encode(&uniform_quant_signal, pcm_encoded_stream, QUANTIZATION_LEVELS);
+        
+        snprintf(filepath, sizeof(filepath), "%s/pcm_encoded_stream.txt", data_dir);
+        FILE *pcm_file = fopen(filepath, "w");
+        if (pcm_file) {
+            for (int i = 0; i < uniform_quant_signal.count; i++) {
+                fprintf(pcm_file, "%s\n", pcm_encoded_stream[i]);
+            }
+            fclose(pcm_file);
+        }
+        for (int i = 0; i < uniform_quant_signal.count; i++) {
+            free(pcm_encoded_stream[i]);
+        }
+        free(pcm_encoded_stream);
+    }
 
     // --- Finalization ---
     fclose(perf_file);
@@ -126,13 +147,11 @@ int main(int argc, char *argv[]) {
     free_signal_data(&mu_law_quant_signal);
     fftw_cleanup();
 
-    printf("\nAnalysis complete for all four signal stages.\n");
+    printf("\nAnalysis complete for all stages.\n");
     return 0;
 }
 
-// The run_full_analysis function remains unchanged
 void run_full_analysis(SignalData* signal, const char* suffix, const char* data_dir, FILE* perf_file) {
-    // ... (code is unchanged)
     char filepath[256];
     char method_name[128];
     PerformanceMetrics metrics;
