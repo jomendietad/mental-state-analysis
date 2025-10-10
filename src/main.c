@@ -1,27 +1,16 @@
-/*
- * main.c: Main entry point for the EEG Signal Analysis Pipeline.
- *
- * This program reads a specified column from a CSV file, normalizes it,
- * and then performs a multi-stage comparative analysis:
- * 1. On the normalized original signal.
- * 2. On a pre-processed (detrended and filtered) version.
- * 3. On a uniformly quantized version of the filtered signal.
- * 4. On a non-uniformly (mu-law) quantized version of the filtered signal.
- * 5. A PCM binary encoding is generated from the uniform quantized signal for visualization.
- *
- * It benchmarks each analysis and writes all results for Python visualization.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "csv_parser.h"
 #include "signal_processing.h"
 #include "performance_monitor.h"
 
 #define SAMPLING_RATE 256.0
-#define QUANTIZATION_LEVELS 256 // 2^8 for 8-bit quantization
-#define MU_PARAMETER 255.0      // Standard for 8-bit mu-law
+#define MU_PARAMETER 255.0
+#define WGN_AMPLITUDE 1.0
+#define MULTITAPER_NW 2.5
+#define MULTITAPER_K 4
 
 void run_full_analysis(SignalData* signal, const char* suffix, const char* data_dir, FILE* perf_file);
 
@@ -30,6 +19,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <csv_file> <column_name> <output_data_dir>\n", argv[0]);
         return 1;
     }
+
+    srand(time(NULL));
 
     const char *filename = argv[1];
     const char *column_name = argv[2];
@@ -77,7 +68,6 @@ int main(int argc, char *argv[]) {
     if (filtered_signal.data == NULL) { fprintf(stderr, "Failed to allocate memory for filtered signal.\n"); return 1; }
     memcpy(filtered_signal.data, raw_signal.data, raw_signal.count * sizeof(double));
     
-    // --- Pre-processing Step 2: Detrend + Filter ---
     printf("\n--- Pre-processing Signal (Detrend + Filter) ---\n");
     detrend_signal(&filtered_signal);
     butterworth_bandpass_filter_4th_order(&filtered_signal, SAMPLING_RATE, 1.0, 40.0);
@@ -86,45 +76,61 @@ int main(int argc, char *argv[]) {
     printf("\n--- Running Analysis on FILTERED Signal ---\n");
     run_full_analysis(&filtered_signal, "_filtered", data_dir, perf_file);
 
-    // --- Create a copy for the uniformly quantized signal ---
+    // --- Stage 3: Uniform Quantization (8-bit) ---
     SignalData uniform_quant_signal;
     uniform_quant_signal.count = filtered_signal.count;
     uniform_quant_signal.data = (double*)malloc(filtered_signal.count * sizeof(double));
     if (uniform_quant_signal.data == NULL) { fprintf(stderr, "Failed to allocate memory for uniform quantized signal.\n"); return 1; }
     memcpy(uniform_quant_signal.data, filtered_signal.data, filtered_signal.count * sizeof(double));
-
-    // --- Stage 3: Uniform Quantization ---
-    printf("\n--- Uniformly Quantizing Filtered Signal (%d levels) ---\n", QUANTIZATION_LEVELS);
-    quantize_signal_uniform(&uniform_quant_signal, QUANTIZATION_LEVELS);
-
-    // --- Run 3: Analysis on UNIFORMLY QUANTIZED Signal ---
+    printf("\n--- Uniformly Quantizing Filtered Signal (8-bit, 256 levels) ---\n");
+    quantize_signal_uniform(&uniform_quant_signal, 256);
     printf("\n--- Running Analysis on UNIFORM QUANTIZED Signal ---\n");
     run_full_analysis(&uniform_quant_signal, "_uniform_quantized", data_dir, perf_file);
 
-    // --- Create a copy for the mu-law quantized signal ---
+    // --- Stage 4: Mu-Law Quantization (8-bit) ---
     SignalData mu_law_quant_signal;
     mu_law_quant_signal.count = filtered_signal.count;
     mu_law_quant_signal.data = (double*)malloc(filtered_signal.count * sizeof(double));
     if (mu_law_quant_signal.data == NULL) { fprintf(stderr, "Failed to allocate memory for mu-law quantized signal.\n"); return 1; }
     memcpy(mu_law_quant_signal.data, filtered_signal.data, filtered_signal.count * sizeof(double));
-
-    // --- Stage 4: Mu-Law Quantization ---
     printf("\n--- Mu-Law Quantizing Filtered Signal (mu=%.1f) ---\n", MU_PARAMETER);
-    quantize_signal_mu_law(&mu_law_quant_signal, QUANTIZATION_LEVELS, MU_PARAMETER);
-
-    // --- Run 4: Analysis on MU-LAW QUANTIZED Signal ---
+    quantize_signal_mu_law(&mu_law_quant_signal, 256, MU_PARAMETER);
     printf("\n--- Running Analysis on MU-LAW QUANTIZED Signal ---\n");
     run_full_analysis(&mu_law_quant_signal, "_mu_law_quantized", data_dir, perf_file);
 
-    // --- Stage 5: PCM Encoding (for visualization only) ---
+    // --- Generate lower-bit-rate signals for error analysis only ---
+    printf("\n--- Generating lower-bit-rate signals for error analysis ---\n");
+    // 4-bit
+    SignalData quant_4bit_signal;
+    quant_4bit_signal.count = filtered_signal.count;
+    quant_4bit_signal.data = (double*)malloc(filtered_signal.count * sizeof(double));
+    if (quant_4bit_signal.data) {
+        memcpy(quant_4bit_signal.data, filtered_signal.data, filtered_signal.count * sizeof(double));
+        quantize_signal_uniform(&quant_4bit_signal, 16); // 2^4 = 16 levels
+        snprintf(filepath, sizeof(filepath), "%s/signal_quantized_4bit.txt", data_dir);
+        write_array_to_file(filepath, quant_4bit_signal.data, quant_4bit_signal.count);
+        free_signal_data(&quant_4bit_signal);
+    }
+    // 2-bit
+    SignalData quant_2bit_signal;
+    quant_2bit_signal.count = filtered_signal.count;
+    quant_2bit_signal.data = (double*)malloc(filtered_signal.count * sizeof(double));
+    if (quant_2bit_signal.data) {
+        memcpy(quant_2bit_signal.data, filtered_signal.data, filtered_signal.count * sizeof(double));
+        quantize_signal_uniform(&quant_2bit_signal, 4); // 2^2 = 4 levels
+        snprintf(filepath, sizeof(filepath), "%s/signal_quantized_2bit.txt", data_dir);
+        write_array_to_file(filepath, quant_2bit_signal.data, quant_2bit_signal.count);
+        free_signal_data(&quant_2bit_signal);
+    }
+
+    // --- PCM Encoding (from 8-bit signal for visualization) ---
     printf("\n--- Generating PCM Encoded Stream for Visualization ---\n");
     char **pcm_encoded_stream = malloc(uniform_quant_signal.count * sizeof(char *));
     if (pcm_encoded_stream) {
         for (int i = 0; i < uniform_quant_signal.count; i++) {
-            pcm_encoded_stream[i] = malloc(9 * sizeof(char)); // 8 bits + null terminator
+            pcm_encoded_stream[i] = malloc(9 * sizeof(char));
         }
-        pcm_encode(&uniform_quant_signal, pcm_encoded_stream, QUANTIZATION_LEVELS);
-        
+        pcm_encode(&uniform_quant_signal, pcm_encoded_stream, 256);
         snprintf(filepath, sizeof(filepath), "%s/pcm_encoded_stream.txt", data_dir);
         FILE *pcm_file = fopen(filepath, "w");
         if (pcm_file) {
@@ -138,7 +144,7 @@ int main(int argc, char *argv[]) {
         }
         free(pcm_encoded_stream);
     }
-
+    
     // --- Finalization ---
     fclose(perf_file);
     free_signal_data(&raw_signal);
@@ -157,21 +163,27 @@ void run_full_analysis(SignalData* signal, const char* suffix, const char* data_
     PerformanceMetrics metrics;
     struct rusage usage_start, usage_end;
     struct timespec timer_start;
+
     snprintf(filepath, sizeof(filepath), "%s/signal%s.txt", data_dir, suffix);
     write_array_to_file(filepath, signal->data, signal->count);
-    printf("Calculating autocorrelation...\n");
-    double *acf = (double *)malloc(signal->count * sizeof(double));
-    if (!acf) { fprintf(stderr, "ACF allocation failed.\n"); return; }
-    calculate_autocorrelation(signal, acf);
-    snprintf(filepath, sizeof(filepath), "%s/acf%s.txt", data_dir, suffix);
-    write_array_to_file(filepath, acf, signal->count);
-    free(acf);
+
+    // --- Autocorrelation (Unbiased FFT method) ---
+    printf("Calculating autocorrelation (FFT method)...\n");
+    double *acf_fft = (double *)malloc(signal->count * sizeof(double));
+    if (acf_fft) {
+        calculate_autocorrelation_fft(signal, acf_fft);
+        snprintf(filepath, sizeof(filepath), "%s/acf_fft%s.txt", data_dir, suffix);
+        write_array_to_file(filepath, acf_fft, signal->count);
+        free(acf_fft);
+    }
+
+    // --- PSD: Periodogram ---
     printf("Analyzing PSD with Periodogram...\n");
     double* psd_periodogram_data = (double *)malloc((signal->count / 2 + 1) * sizeof(double));
     if (!psd_periodogram_data) { fprintf(stderr, "Periodogram allocation failed.\n"); return; }
     fftw_plan p = NULL;
     start_timer(&timer_start); get_cpu_usage(&usage_start);
-    psd_periodogram(signal, psd_periodogram_data, &p);
+    psd_periodogram(signal, psd_periodogram_data, &p, 1); // Use window
     get_cpu_usage(&usage_end); metrics.execution_time_sec = stop_timer(&timer_start);
     metrics.peak_memory_kb = get_peak_memory_kb();
     metrics.cpu_user_time_us = (usage_end.ru_utime.tv_sec - usage_start.ru_utime.tv_sec) * 1000000L + (usage_end.ru_utime.tv_usec - usage_start.ru_utime.tv_usec);
@@ -182,6 +194,8 @@ void run_full_analysis(SignalData* signal, const char* suffix, const char* data_
     write_array_to_file(filepath, psd_periodogram_data, signal->count / 2 + 1);
     free(psd_periodogram_data);
     fftw_destroy_plan(p);
+
+    // --- PSD: Welch's Method (Advanced) ---
     printf("Analyzing PSD with Welch (multiple windows)...\n");
     int welch_windows[] = {128, 256, 512, 1024, 2048, 4096};
     int num_windows = sizeof(welch_windows) / sizeof(welch_windows[0]);
@@ -191,7 +205,7 @@ void run_full_analysis(SignalData* signal, const char* suffix, const char* data_
         double* psd_welch_data = (double *)malloc((nperseg / 2 + 1) * sizeof(double));
         if (!psd_welch_data) { fprintf(stderr, "Welch allocation failed for window %d.\n", nperseg); continue; }
         start_timer(&timer_start); get_cpu_usage(&usage_start);
-        psd_welch(signal, psd_welch_data, nperseg, nperseg / 2);
+        psd_welch_advanced(signal, psd_welch_data, SAMPLING_RATE, nperseg, nperseg / 2);
         get_cpu_usage(&usage_end); metrics.execution_time_sec = stop_timer(&timer_start);
         metrics.peak_memory_kb = get_peak_memory_kb();
         metrics.cpu_user_time_us = (usage_end.ru_utime.tv_sec - usage_start.ru_utime.tv_sec) * 1000000L + (usage_end.ru_utime.tv_usec - usage_start.ru_utime.tv_usec);
@@ -202,11 +216,13 @@ void run_full_analysis(SignalData* signal, const char* suffix, const char* data_
         write_array_to_file(filepath, psd_welch_data, nperseg / 2 + 1);
         free(psd_welch_data);
     }
-    printf("Analyzing PSD with Multitaper...\n");
+
+    // --- PSD: Multitaper (Gaussian) ---
+    printf("Analyzing PSD with Multitaper (Gaussian)...\n");
     double* psd_multitaper_data = (double *)malloc((signal->count / 2 + 1) * sizeof(double));
     if (!psd_multitaper_data) { fprintf(stderr, "Multitaper allocation failed.\n"); return; }
     start_timer(&timer_start); get_cpu_usage(&usage_start);
-    psd_multitaper(signal, psd_multitaper_data);
+    psd_multitaper_gaussian(signal, psd_multitaper_data, SAMPLING_RATE, MULTITAPER_NW, MULTITAPER_K);
     get_cpu_usage(&usage_end); metrics.execution_time_sec = stop_timer(&timer_start);
     metrics.peak_memory_kb = get_peak_memory_kb();
     metrics.cpu_user_time_us = (usage_end.ru_utime.tv_sec - usage_start.ru_utime.tv_sec) * 1000000L + (usage_end.ru_utime.tv_usec - usage_start.ru_utime.tv_usec);
